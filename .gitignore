@@ -1,0 +1,4 @@
+.env
+results.csv
+node_modules
+coordinates.json

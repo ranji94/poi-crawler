@@ -1,0 +1,22 @@
+{
+  "name": "maps-data",
+  "version": "1.0.0",
+  "description": "Fetching important detais from GMaps",
+  "main": "index.js",
+  "scripts": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "none"
+  },
+  "keywords": [
+    "maps"
+  ],
+  "author": "Yeti",
+  "license": "MIT",
+  "dependencies": {
+    "@googlemaps/google-maps-services-js": "^3.4.2",
+    "dotenv": "^17.3.1"
+  }
+}
