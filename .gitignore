@@ -1,4 +1,39 @@
+# Environment variables
 .env
-results.csv
-node_modules
-coordinates.json
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Generated output
+results*.csv
+*.csv
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs
+logs
+*.log
+
+# Test coverage
+coverage/
+
+# Lock files
+package-lock.json
+yarn.lock
+
+# Temporary files
+tmp/
+temp/
+
+# Docker
+docker-compose.override.yml
