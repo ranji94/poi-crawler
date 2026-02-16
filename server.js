@@ -36,12 +36,13 @@ app.get('/', (req, res) => {
       {
         path: '/api/poi',
         method: 'GET',
-        description: 'Get nearby points of interest',
+        description: 'Get nearby points of interest (returns JSON or downloadable CSV)',
         params: {
           lon: 'Longitude (required)',
           lat: 'Latitude (required)',
           radius: 'Search radius in kilometers (optional)',
-          mode: 'Transport mode: walking, driving, bicycling, transit (optional)'
+          mode: 'Transport mode: walking, driving, bicycling, transit (optional)',
+          format: 'Response format: csv for direct download (optional)'
         }
       },
       {

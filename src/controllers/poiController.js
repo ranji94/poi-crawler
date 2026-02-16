@@ -4,6 +4,8 @@
 
 const googleMapsService = require('../services/googleMaps');
 const csvUtils = require('../utils/csv');
+const fs = require('fs');
+const path = require('path');
 
 /**
  * Get nearby points of interest
@@ -143,17 +145,43 @@ async function getNearbyPOI(req, res) {
       return formattedPlace;
     });
     
-    // Export to CSV and include the file path
-    const csvPath = `results_${new Date().getTime()}.csv`;
-    csvUtils.exportToCSV(results, transitTypes, csvPath);
+    // Check if CSV format was explicitly requested
+    const format = req.query.format?.toLowerCase();
+    const acceptHeader = req.headers.accept || '';
+    const wantsCsv = format === 'csv' || acceptHeader.includes('text/csv');
     
-    // Return success response with data
-    return res.status(200).json({
-      success: true,
-      count: formattedPlaces.length,
-      csvFile: csvPath,
-      data: formattedPlaces
-    });
+    // Generate a unique filename for the CSV
+    const timestamp = new Date().getTime();
+    const filename = `poi_results_${timestamp}.csv`;
+    const csvPath = path.join(process.cwd(), filename);
+    
+    // Export data to CSV file
+    csvUtils.exportToCSV(results, transitTypes, filename);
+    
+    if (wantsCsv) {
+      // Set headers for CSV download
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      
+      // Read the CSV file and send it as the response
+      const fileStream = fs.createReadStream(csvPath);
+      fileStream.pipe(res);
+      
+      // Clean up the file after sending (when the response is finished)
+      res.on('finish', () => {
+        fs.unlink(csvPath, (err) => {
+          if (err) console.error(`Error deleting temporary CSV file: ${err.message}`);
+        });
+      });
+    } else {
+      // Return JSON response with data and CSV file information
+      return res.status(200).json({
+        success: true,
+        count: formattedPlaces.length,
+        csvDownloadUrl: `/api/poi?${new URLSearchParams({...req.query, format: 'csv'})}`,
+        data: formattedPlaces
+      });
+    }
     
   } catch (error) {
     console.error(`Error in getNearbyPOI controller: ${error.message}`);
