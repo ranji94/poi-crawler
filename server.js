@@ -3,11 +3,19 @@
  */
 
 const express = require('express');
+const cors = require('cors');
 const config = require('./src/config/config');
 const poiController = require('./src/controllers/poiController');
 
 // Initialize Express app
 const app = express();
+
+// CORS
+app.use(cors({
+  origin: 'http://192.168.0.254:15011', // Zezwalaj tylko na ten konkretny adres frontendu
+  methods: ['GET', 'POST'],            // Dozwolone metody
+  allowedHeaders: ['Content-Type', 'Accept']
+}));
 
 // Middleware
 app.use(express.json());
