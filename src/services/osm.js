@@ -1,65 +1,108 @@
 /**
  * Service for interacting with OpenStreetMap via Overpass API
+ * Includes caching, retry logic, and request throttling
  * No API key required - public endpoint
  */
 
 const https = require('https');
 const config = require('../config/config');
+const cacheUtils = require('../utils/cache');
+const { withRetry, getOverpassRetryConfig } = require('../utils/retry');
+const { throttleOverpassRequest } = require('../utils/throttle');
+
+// Cache TTLs
+const OSM_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
  * Execute an Overpass QL query via HTTP POST and return parsed JSON.
+ * Includes built-in retry mechanism, throttling, and caching.
  * POST is preferred over GET to avoid URL length limits and to get
  * proper JSON error responses from the Overpass server.
+ * 
  * @param {string} query - Overpass QL query string
+ * @param {string} cacheKey - Optional cache key for caching the result
  * @returns {Promise<Object>} - Parsed JSON response
  */
-function runOverpassQuery(query) {
-  return new Promise((resolve, reject) => {
-    const endpointUrl = new URL(config.osm.endpoint);
-    const postBody = `data=${encodeURIComponent(query)}`;
+async function runOverpassQuery(query, cacheKey = null) {
+  // Check cache if a cache key is provided
+  if (cacheKey) {
+    const cached = cacheUtils.get(cacheKey);
+    if (cached) {
+      console.log('ℹ️  Using cached Overpass API result.');
+      return cached;
+    }
+  }
 
-    const options = {
-      hostname: endpointUrl.hostname,
-      port: endpointUrl.port || 443,
-      path: endpointUrl.pathname + (endpointUrl.search || ''),
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(postBody),
-        'Accept': 'application/json',
-        'User-Agent': 'poi-crawler/1.0 (Node.js) (contact: jedrzej.piasecki94@gmail.com)'
-      }
-    };
+  // Create an async function to run the actual query
+  const executeQuery = () => {
+    return new Promise((resolve, reject) => {
+      const endpointUrl = new URL(config.osm.endpoint);
+      const postBody = `data=${encodeURIComponent(query)}`;
 
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 429) {
-          return reject(new Error(`Overpass API rate limit exceeded (HTTP 429). Try again later.`));
+      const options = {
+        hostname: endpointUrl.hostname,
+        port: endpointUrl.port || 443,
+        path: endpointUrl.pathname + (endpointUrl.search || ''),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(postBody),
+          'Accept': 'application/json',
+          'User-Agent': 'poi-crawler/1.0 (Node.js) (contact: jedrzej.piasecki94@gmail.com)'
         }
-        if (res.statusCode >= 400) {
-          return reject(new Error(`Overpass API returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
-        }
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          // Log first 300 chars of the unexpected response for debugging
-          const preview = data.slice(0, 300).replace(/\n/g, ' ');
-          reject(new Error(`Failed to parse Overpass response (HTTP ${res.statusCode}): ${preview}`));
-        }
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          if (res.statusCode === 429) {
+            return reject(new Error(`Overpass API rate limit exceeded (HTTP 429). Try again later.`));
+          }
+          if (res.statusCode >= 400) {
+            return reject(new Error(`Overpass API returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          }
+          try {
+            const parsed = JSON.parse(data);
+            resolve(parsed);
+          } catch (e) {
+            // Log first 300, but cap to prevent console flooding
+            const preview = data.slice(0, 300).replace(/\n/g, ' ');
+            reject(new Error(`Failed to parse Overpass response (HTTP ${res.statusCode}): ${preview}`));
+          }
+        });
       });
-    });
 
-    req.on('error', (err) => reject(err));
-    req.setTimeout(config.osm.timeoutMs, () => {
-      req.destroy();
-      reject(new Error('Overpass API request timed out'));
-    });
+      req.on('error', (err) => reject(err));
+      
+      // Set a timeout that's a bit shorter than the query timeout
+      // This ensures we can retry before the Overpass server itself times out
+      req.setTimeout(Math.min(config.osm.timeoutMs, 25000), () => {
+        req.destroy();
+        reject(new Error('Overpass API request timed out'));
+      });
 
-    req.write(postBody);
-    req.end();
-  });
+      req.write(postBody);
+      req.end();
+    });
+  };
+
+  // Run the query with throttling and retry
+  try {
+    const result = await throttleOverpassRequest(() => 
+      withRetry(executeQuery, getOverpassRetryConfig())
+    );
+    
+    // Cache successful result if cache key is provided
+    if (cacheKey) {
+      cacheUtils.set(cacheKey, result, OSM_CACHE_TTL);
+    }
+    
+    return result;
+  } catch (error) {
+    console.error(`❌ Overpass API error after retries: ${error.message}`);
+    throw error;
+  }
 }
 
 /**
@@ -149,16 +192,23 @@ function extractLinesFromTags(tags) {
 
 /**
  * Build Overpass QL query for all configured place types within a radius
+ * Breaks down into smaller queries if radius is large to avoid timeouts
+ * 
  * @param {number} lat - Latitude
  * @param {number} lon - Longitude
  * @param {number} radiusMeters - Search radius in meters
  * @returns {string} - Overpass QL query
  */
 function buildOverpassQuery(lat, lon, radiusMeters) {
+  // If radius is large (>2km), use a reduced timeout to avoid server timeouts
+  // The Overpass server enforces its own timeout regardless of what we set
+  const timeoutSeconds = radiusMeters > 2000 ? 25 : Math.ceil(config.osm.timeoutMs / 1000);
+  
+  // Build the around clause with the provided radius
   const around = `(around:${radiusMeters},${lat},${lon})`;
 
   return `
-[out:json][timeout:${Math.ceil(config.osm.timeoutMs / 1000)}];
+[out:json][timeout:${timeoutSeconds}];
 (
   node[highway=bus_stop]${around};
   node[amenity=bus_station]${around};
@@ -186,6 +236,97 @@ function buildOverpassQuery(lat, lon, radiusMeters) {
 );
 out center;
 `.trim();
+}
+
+/**
+ * Build targeted Overpass queries for specific place types
+ * Used as a fallback when the full query times out
+ * 
+ * @param {number} lat - Latitude
+ * @param {number} lon - Longitude
+ * @param {number} radiusMeters - Search radius in meters
+ * @returns {Array<Object>} - Array of objects with type and query
+ */
+function buildTypeSpecificQueries(lat, lon, radiusMeters) {
+  const around = `(around:${radiusMeters},${lat},${lon})`;
+  const timeoutSeconds = 20; // Shorter timeout for targeted queries
+  
+  // Group similar types to reduce total query count
+  return [
+    // Transit stops
+    {
+      type: 'transit',
+      query: `
+[out:json][timeout:${timeoutSeconds}];
+(
+  node[highway=bus_stop]${around};
+  node[amenity=bus_station]${around};
+  node[railway=station]${around};
+  node[railway=halt]${around};
+  node[railway=tram_stop]${around};
+  node[railway=subway_entrance]${around};
+  node[public_transport=stop_position]${around};
+  node[public_transport=platform]${around};
+  node[public_transport=station]${around};
+);
+out center;
+`.trim()
+    },
+    // Parks and nature reserves
+    {
+      type: 'parks',
+      query: `
+[out:json][timeout:${timeoutSeconds}];
+(
+  node[leisure=park]${around};
+  node[leisure=nature_reserve]${around};
+  way[leisure=park]${around};
+  way[leisure=nature_reserve]${around};
+);
+out center;
+`.trim()
+    },
+    // Shopping
+    {
+      type: 'shopping',
+      query: `
+[out:json][timeout:${timeoutSeconds}];
+(
+  node[shop=mall]${around};
+  node[shop=supermarket]${around};
+  way[shop=mall]${around};
+  way[shop=supermarket]${around};
+);
+out center;
+`.trim()
+    },
+    // Education
+    {
+      type: 'education',
+      query: `
+[out:json][timeout:${timeoutSeconds}];
+(
+  node[amenity=school]${around};
+  node[amenity=kindergarten]${around};
+  node[amenity=childcare]${around};
+  way[amenity=school]${around};
+);
+out center;
+`.trim()
+    },
+    // Healthcare
+    {
+      type: 'healthcare',
+      query: `
+[out:json][timeout:${timeoutSeconds}];
+(
+  node[amenity=hospital]${around};
+  way[amenity=hospital]${around};
+);
+out center;
+`.trim()
+    }
+  ];
 }
 
 /**
@@ -223,6 +364,9 @@ out tags;
 
 /**
  * Get nearby places from OpenStreetMap
+ * Uses caching, throttling, and retry logic for resilience.
+ * Falls back to smaller, targeted queries if large query times out.
+ * 
  * @param {Object} params - Search parameters
  * @param {number} params.lat - Latitude
  * @param {number} params.lon - Longitude
@@ -235,18 +379,68 @@ async function getNearbyPlacesOSM(params) {
 
   console.log('🗺️  Querying OpenStreetMap (Overpass API)...');
 
-  const query = buildOverpassQuery(lat, lon, radiusMeters);
-
-  let data;
-  try {
-    data = await runOverpassQuery(query);
-  } catch (err) {
-    console.error(`❌ Overpass API error: ${err.message}`);
-    return [];
+  // Generate a cache key
+  const cacheKey = cacheUtils.generateCacheKey('osm-places', {
+    lat,
+    lon,
+    radiusKm
+  });
+  
+  // Check cache first
+  const cachedPlaces = cacheUtils.get(cacheKey);
+  if (cachedPlaces) {
+    console.log(`📍 OSM: found ${cachedPlaces.length} places (from cache).`);
+    return cachedPlaces;
   }
 
-  if (!data.elements || data.elements.length === 0) {
+  // Build the main query
+  const query = buildOverpassQuery(lat, lon, radiusMeters);
+  
+  // Results container
+  let elements = [];
+  
+  try {
+    // Try the main comprehensive query first with caching
+    const data = await runOverpassQuery(query, `osm-query-${lat}-${lon}-${radiusMeters}`);
+    elements = data.elements || [];
+  } catch (mainErr) {
+    console.error(`⚠️ Main Overpass query failed: ${mainErr.message} - falling back to smaller targeted queries.`);
     
+    // If main query fails (likely timeout for large radius), try separate targeted queries
+    const typeQueries = buildTypeSpecificQueries(lat, lon, radiusMeters);
+    
+    // Run all type-specific queries concurrently
+    const typeResults = await Promise.allSettled(
+      typeQueries.map(({ type, query }) => 
+        runOverpassQuery(query, `osm-query-${type}-${lat}-${lon}-${radiusMeters}`)
+          .catch(err => {
+            console.error(`❌ ${type} query failed: ${err.message}`);
+            return { elements: [] };
+          })
+      )
+    );
+    
+    // Extract elements from successful queries and combine
+    typeResults.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value.elements) {
+        console.log(`✅ ${typeQueries[index].type} query returned ${result.value.elements.length} elements.`);
+        elements.push(...result.value.elements);
+      }
+    });
+    
+    // Remove potential duplicates by ID
+    const uniqueIds = new Set();
+    elements = elements.filter(element => {
+      const elementId = `${element.type}/${element.id}`;
+      if (uniqueIds.has(elementId)) {
+        return false;
+      }
+      uniqueIds.add(elementId);
+      return true;
+    });
+  }
+
+  if (elements.length === 0) {
     console.log('ℹ️  No OSM elements found in the area.');
     return [];
   }
@@ -254,7 +448,7 @@ async function getNearbyPlacesOSM(params) {
   const transitTypes = new Set(config.transitTypes);
   const places = [];
 
-  for (const element of data.elements) {
+  for (const element of elements) {
     const tags = element.tags || {};
 
     // Skip unnamed elements without meaningful tags
@@ -315,14 +509,14 @@ rel[type=route](bn);
 out tags;
 `.trim();
 
-        const routeData = await runOverpassQuery(batchQuery);
+        // Use a specific cache key for route data
+        const routeCacheKey = `osm-routes-${nodeIds.join('-')}`;
+        const routeData = await runOverpassQuery(batchQuery, routeCacheKey);
 
         if (routeData.elements && routeData.elements.length > 0) {
           // Build a map: nodeId -> [line refs]
           // Overpass returns relations; we need to cross-reference via members
           // Since we queried by node IDs, all returned relations pass through at least one of our stops.
-          // We'll do a second targeted query per stop only if needed.
-          // For now, collect all refs from returned relations as a shared pool.
           const allRefs = routeData.elements
             .map(rel => rel.tags && (rel.tags.ref || rel.tags.name))
             .filter(Boolean)
@@ -339,9 +533,13 @@ out tags;
         }
       } catch (err) {
         console.error(`⚠️  Batch route query failed: ${err.message}`);
+        // Continue execution - route data is non-essential
       }
     }
   }
+
+  // Cache the result
+  cacheUtils.set(cacheKey, places, OSM_CACHE_TTL);
 
   return places;
 }

@@ -1,10 +1,13 @@
 /**
  * Controller for Points of Interest (POI) endpoints
+ * Handles API requests for nearby places, with robust error handling
+ * to ensure partial results are returned when possible
  */
 
 const googleMapsService = require('../services/googleMaps');
 const osmService = require('../services/osm');
 const csvUtils = require('../utils/csv');
+const cacheUtils = require('../utils/cache');
 const config = require('../config/config');
 const fs = require('fs');
 const path = require('path');
@@ -70,6 +73,8 @@ function mergePlaces(googlePlaces, osmPlaces) {
 
 /**
  * Get nearby points of interest
+ * Improved to handle partial results and API failures
+ * 
  * @param {Object} req - Express request object
  * @param {Object} res - Express response object
  */
@@ -139,11 +144,69 @@ async function getNearbyPOI(req, res) {
 
     const origin = { lat: numLat, lng: numLon };
 
+    // Generate a cache key for this request
+    const requestCacheKey = cacheUtils.generateCacheKey('poi-request', {
+      lat: numLat,
+      lng: numLon,
+      radius: params.radius,
+      mode: params.mode
+    });
+
+    // Check if we have a cached response for this exact request
+    const cachedResponse = cacheUtils.get(requestCacheKey);
+    if (cachedResponse) {
+      console.log('📍 Using cached POI response');
+      
+      // For CSV requests, still need to generate a fresh file
+      const format = req.query.format?.toLowerCase();
+      const acceptHeader = req.headers.accept || '';
+      const wantsCsv = format === 'csv' || acceptHeader.includes('text/csv');
+      
+      if (wantsCsv) {
+        const timestamp = new Date().getTime();
+        const filename = `poi_results_${timestamp}.csv`;
+        const csvPath = path.join(process.cwd(), filename);
+        
+        // Regenerate CSV from cached data
+        const transitTypes = new Set(config.transitTypes);
+        csvUtils.exportToCSV(cachedResponse.sortedPlaces, [...transitTypes], filename);
+        
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        
+        const fileStream = fs.createReadStream(csvPath);
+        fileStream.pipe(res);
+        
+        res.on('finish', () => {
+          fs.unlink(csvPath, err => {
+            if (err) console.error(`Error deleting temporary CSV file: ${err.message}`);
+          });
+        });
+        
+        return;
+      }
+      
+      return res.status(200).json(cachedResponse.jsonResponse);
+    }
+
     // ── Fetch from both sources concurrently ──────────────────────────────────
-    const [googlePlaces, osmPlaces] = await Promise.all([
+    // Use Promise.allSettled to ensure we get partial results even if one API fails
+    const apiResults = await Promise.allSettled([
       googleMapsService.getNearbyPlacesGoogle(params),
       osmService.getNearbyPlacesOSM({ lat: numLat, lon: numLon, radiusKm: params.radius })
     ]);
+
+    // Extract results and handle errors
+    const googlePlaces = apiResults[0].status === 'fulfilled' ? apiResults[0].value : [];
+    const osmPlaces = apiResults[1].status === 'fulfilled' ? apiResults[1].value : [];
+    
+    // Log API errors for monitoring/debugging
+    if (apiResults[0].status === 'rejected') {
+      console.error('⚠️ Google Maps API failed:', apiResults[0].reason.message);
+    }
+    if (apiResults[1].status === 'rejected') {
+      console.error('⚠️ OSM API failed:', apiResults[1].reason.message);
+    }
 
     // ── Merge & deduplicate ───────────────────────────────────────────────────
     const mergedPlaces = mergePlaces(googlePlaces, osmPlaces);
@@ -151,17 +214,56 @@ async function getNearbyPOI(req, res) {
     if (mergedPlaces.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'No places found in the specified area'
+        message: 'No places found in the specified area',
+        // Include API errors in response for better debugging
+        details: {
+          googleStatus: apiResults[0].status,
+          googleError: apiResults[0].reason?.message,
+          osmStatus: apiResults[1].status,
+          osmError: apiResults[1].reason?.message
+        }
       });
     }
 
-    // ── Enrich with distances (single Distance Matrix call) ───────────────────
+    // ── Enrich with distances (with proper error handling) ────────────────────
     console.log(`📏 Calculating distances for ${mergedPlaces.length} places...`);
-    const placesWithDistances = await googleMapsService.enrichWithDistances(
-      origin,
-      mergedPlaces,
-      params.mode
-    );
+    let placesWithDistances;
+    try {
+      placesWithDistances = await googleMapsService.enrichWithDistances(
+        origin,
+        mergedPlaces,
+        params.mode
+      );
+    } catch (distanceError) {
+      console.error(`❌ Distance calculation failed completely: ${distanceError.message}`);
+      // If distance enrichment fails completely, apply fallback Haversine calculation
+      // to all places to ensure we still return results
+      placesWithDistances = mergedPlaces.map(place => {
+        if (place.location && place.location.lat && place.location.lng) {
+          const distanceText = require('../utils/distance').calculateHaversineDistance(
+            origin.lat, origin.lng,
+            place.location.lat, place.location.lng
+          );
+          
+          let distanceInKm;
+          if (distanceText.includes('km')) {
+            distanceInKm = parseFloat(distanceText.split(' ')[0]);
+          } else {
+            distanceInKm = parseFloat(distanceText.split(' ')[0]) / 1000;
+          }
+          
+          const timeText = require('../utils/distance').calculateTransitTime(distanceInKm, params.mode);
+          
+          return {
+            ...place,
+            distance: `${distanceText} (przybliżone)`,
+            duration: `${timeText} (przybliżone)`,
+            durationValue: distanceInKm * 12
+          };
+        }
+        return { ...place, distance: 'N/A', duration: 'N/A', durationValue: 999999 };
+      });
+    }
 
     // Sort by travel duration ascending
     const sortedPlaces = placesWithDistances.sort(
@@ -223,18 +325,41 @@ async function getNearbyPOI(req, res) {
       return formattedPlace;
     });
 
+    // Create JSON response object
+    const jsonResponse = {
+      success: true,
+      count: formattedPlaces.length,
+      sources: {
+        google: googlePlaces.length,
+        osm: osmPlaces.length,
+        merged: mergedPlaces.length
+      },
+      apiStatus: {
+        google: apiResults[0].status === 'fulfilled' ? 'success' : 'error',
+        osm: apiResults[1].status === 'fulfilled' ? 'success' : 'error',
+      },
+      csvDownloadUrl: `/api/poi?${new URLSearchParams({ ...req.query, format: 'csv' })}`,
+      data: formattedPlaces
+    };
+
+    // Cache the response data for future use
+    cacheUtils.set(requestCacheKey, {
+      jsonResponse,
+      sortedPlaces
+    }, config.cache.ttl.places);
+
     // ── CSV export ────────────────────────────────────────────────────────────
     const format = req.query.format?.toLowerCase();
     const acceptHeader = req.headers.accept || '';
     const wantsCsv = format === 'csv' || acceptHeader.includes('text/csv');
 
-    const timestamp = new Date().getTime();
-    const filename = `poi_results_${timestamp}.csv`;
-    const csvPath = path.join(process.cwd(), filename);
-
-    csvUtils.exportToCSV(sortedPlaces, [...transitTypes], filename);
-
     if (wantsCsv) {
+      const timestamp = new Date().getTime();
+      const filename = `poi_results_${timestamp}.csv`;
+      const csvPath = path.join(process.cwd(), filename);
+
+      csvUtils.exportToCSV(sortedPlaces, [...transitTypes], filename);
+
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
@@ -247,25 +372,18 @@ async function getNearbyPOI(req, res) {
         });
       });
     } else {
-      return res.status(200).json({
-        success: true,
-        count: formattedPlaces.length,
-        sources: {
-          google: googlePlaces.length,
-          osm: osmPlaces.length,
-          merged: mergedPlaces.length
-        },
-        csvDownloadUrl: `/api/poi?${new URLSearchParams({ ...req.query, format: 'csv' })}`,
-        data: formattedPlaces
-      });
+      return res.status(200).json(jsonResponse);
     }
 
   } catch (error) {
     console.error(`Error in getNearbyPOI controller: ${error.message}`);
+    
+    // Provide informative error response
     return res.status(500).json({
       success: false,
       message: 'Server error while fetching POIs',
-      error: error.message
+      error: error.message,
+      stackTrace: process.env.NODE_ENV !== 'production' ? error.stack : undefined
     });
   }
 }
