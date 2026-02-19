@@ -1,0 +1,23 @@
+# copy compose.prod.yaml to server run with "docker compose up -d"
+version: "3.8"
+
+services:
+  app:
+    image: poi-crawler:latest
+    restart: unless-stopped
+    ports:
+      - "15010:15010"
+    # network_mode: 'host'
+    container_name: poi-crawler
+    environment:
+      - PORT=${PORT}
+      - GMAPS_API_KEY=${GMAPS_API_KEY}
+      - NO_EXTRA_CALLS=${NO_EXTRA_CALLS}
+      - OSM_OVERPASS_ENDPOINT=${OSM_OVERPASS_ENDPOINT}
+      - OSM_TIMEOUT_MS=${OSM_TIMEOUT_MS}
+    networks:
+      - web_network
+
+networks:
+  web_network:
+    external: true
