@@ -31,7 +31,9 @@ const config = {
   
   // Default search parameters
   search: {
-    defaultRadiusKm: 20,
+    defaultRadiusKm: 5,  // Changed from 20km to 5km as default
+    minRadiusKm: 1,      // Minimum allowed radius
+    maxRadiusKm: 10,     // Maximum allowed radius
     defaultMode: 'walking',
     // Skip extra API calls to reduce costs
     skipExtraCalls: parseBool(process.env.NO_EXTRA_CALLS, false)

@@ -12,6 +12,7 @@
  * @param {number} options.maxDelayMs - Maximum delay in ms (default: 10000)
  * @param {Function} options.shouldRetry - Function to determine if retry is needed (default: retry on any error)
  * @param {Function} options.onRetry - Function called before each retry attempt
+ * @param {boolean} options.skipHttpErrors - Skip retrying on HTTP 4xx/5xx status codes (default: true)
  * @returns {Promise<any>} - Result of the function execution
  */
 async function withRetry(fn, options = {}) {
@@ -20,7 +21,8 @@ async function withRetry(fn, options = {}) {
     initialDelayMs = 500,
     maxDelayMs = 10000,
     shouldRetry = () => true,
-    onRetry = () => {}
+    onRetry = () => {},
+    skipHttpErrors = true
   } = options;
 
   let attempts = 0;
@@ -30,6 +32,12 @@ async function withRetry(fn, options = {}) {
       return await fn();
     } catch (error) {
       attempts += 1;
+      
+      // Skip retrying on HTTP 4xx/5xx errors if skipHttpErrors is true
+      if (skipHttpErrors && error.response && error.response.status >= 400) {
+        console.error(`❌ HTTP error ${error.response.status} - not retrying.`);
+        throw error;
+      }
       
       // Check if we've hit max retries or shouldn't retry this error
       if (attempts > maxRetries || !shouldRetry(error)) {
@@ -124,7 +132,11 @@ function getGoogleMapsRetryConfig() {
     maxRetries: 3,
     initialDelayMs: 1000,
     maxDelayMs: 10000,
-    shouldRetry: (error) => isRateLimitError(error) || isNetworkError(error),
+    skipHttpErrors: true,  // Don't retry on HTTP 4xx/5xx errors
+    shouldRetry: (error) => {
+      // Only retry on network errors, not rate limits or HTTP errors
+      return isNetworkError(error) && !isRateLimitError(error);
+    },
     onRetry: ({ error, attempts, delayMs }) => {
       console.warn(`⚠️ Google Maps API retry ${attempts}: ${error.message} - retrying in ${Math.round(delayMs/1000)}s`);
     }
@@ -141,6 +153,7 @@ function getOverpassRetryConfig() {
     maxRetries: 2,
     initialDelayMs: 2000,
     maxDelayMs: 20000,
+    skipHttpErrors: true,  // Don't retry on HTTP 4xx/5xx errors
     shouldRetry: (error) => {
       const message = error.message || '';
       return (

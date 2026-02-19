@@ -226,7 +226,7 @@ async function getNearbyPOI(req, res) {
     }
 
     // ── Enrich with distances (with proper error handling) ────────────────────
-    console.log(`📏 Calculating distances for ${mergedPlaces.length} places...`);
+    console.log(`� Calculating distances for ${mergedPlaces.length} places...`);
     let placesWithDistances;
     try {
       placesWithDistances = await googleMapsService.enrichWithDistances(

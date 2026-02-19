@@ -1,23 +1,30 @@
-/**
- * Service for interacting with Google Maps APIs
- * Includes caching, retry logic, and request throttling
- */
-
 const { Client } = require("@googlemaps/google-maps-services-js");
-const config = require('../config/config');
-const distanceUtils = require('../utils/distance');
-const placeUtils = require('../utils/place');
-const cacheUtils = require('../utils/cache');
+const config = require("../config/config");
+const cache = require("../utils/cache");
+const { calculateHaversineDistance } = require("../utils/distance");
+const { googleMapsThrottler } = require("../utils/throttle");
 const { withRetry, getGoogleMapsRetryConfig } = require('../utils/retry');
-const { googleMapsThrottler } = require('../utils/throttle');
 
-// Initialize Google Maps client
 const client = new Client({});
 
 // Cache TTLs
 const PLACES_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
-const DISTANCE_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
 
+// Cache keys
+const PLACE_DETAILS_CACHE_KEY = "place-details";
+const DISTANCE_MATRIX_CACHE_KEY = "distance-matrix";
+
+// Constants for error handling
+const MAX_ORIGINS_PER_REQUEST = 25;       // Google Maps API limit for distance matrix
+const MAX_DESTINATIONS_PER_REQUEST = 25;  // Google Maps API limit for distance matrix
+const MAX_ELEMENTS_PER_REQUEST = 100;     // Reduced from Google's 625 to avoid rate limits
+const MAX_REQUESTS_PER_MINUTE = 40;       // Conservative limit (Google allows 100/min for Distance Matrix)
+
+/**
+ * Safely fetches place details from Google Maps API with caching
+ * @param {string} placeId - Google Place ID
+ * @returns {Promise<Object>} Place details or null on error
+ */
 /**
  * Get nearby places from Google Maps (Places API)
  * Uses caching, throttling, and retry logic for resilience.
@@ -50,13 +57,13 @@ async function getNearbyPlacesGoogle(params) {
     console.log('🔍 Searching for nearby places via Google Maps...');
 
     // Check cache first
-    const cacheKey = cacheUtils.generateCacheKey('google-places', {
+    const cacheKey = cache.generateCacheKey('google-places', {
       lat: origin.lat,
       lng: origin.lng,
       radius: radiusMeters
     });
     
-    const cachedPlaces = cacheUtils.get(cacheKey);
+    const cachedPlaces = cache.get(cacheKey);
     if (cachedPlaces) {
       console.log(`📍 Google Maps: found ${cachedPlaces.length} places (from cache).`);
       return cachedPlaces;
@@ -103,7 +110,7 @@ async function getNearbyPlacesGoogle(params) {
         const filtered = found.filter(place => {
           const educationalTypes = ['school', 'primary_school', 'preschool', 'day_care'];
           if (place.type === 'hospital' || educationalTypes.includes(place.type)) {
-            return placeUtils.isPublicFacility(place);
+            return require('../utils/place').isPublicFacility(place);
           }
           return true;
         });
@@ -113,7 +120,7 @@ async function getNearbyPlacesGoogle(params) {
     });
 
     // Cache the results
-    cacheUtils.set(cacheKey, places, PLACES_CACHE_TTL);
+    cache.set(cacheKey, places, PLACES_CACHE_TTL);
 
     console.log(`📍 Google Maps: found ${places.length} places.`);
     return places;
@@ -125,161 +132,407 @@ async function getNearbyPlacesGoogle(params) {
 }
 
 /**
- * Calculate distances for a list of places using Distance Matrix API,
- * with retries, throttling, caching, and fallback to Haversine approximation on failure.
- * 
- * @param {Object} origin - { lat, lng }
- * @param {Array}  places - Array of place objects with .location
- * @param {string} mode   - Transport mode
- * @returns {Promise<Array>} - Places enriched with distance/duration fields
+ * Safely fetches place details from Google Maps API with caching
+ * @param {string} placeId - Google Place ID
+ * @returns {Promise<Object>} Place details or null on error
  */
-async function enrichWithDistances(origin, places, mode) {
-  if (places.length === 0) return [];
-
-  const travelMode = mode || config.search.defaultMode;
-
+const getPlaceDetails = async (placeId) => {
+  const cacheKey = `${PLACE_DETAILS_CACHE_KEY}-${placeId}`;
+  
   // Check cache first
-  const cacheKey = cacheUtils.generateCacheKey('distance-matrix', {
-    origin: `${origin.lat},${origin.lng}`,
-    mode: travelMode,
-    // Use place IDs for the cache key to handle the same set of places
-    places: places.map(p => p.id || `${p.location.lat},${p.location.lng}`)
-  });
-  
-  const cachedResult = cacheUtils.get(cacheKey);
-  if (cachedResult) {
-    console.log(`📏 Using cached distance calculations for ${places.length} places.`);
-    return cachedResult;
+  const cachedData = cache.get(cacheKey);
+  if (cachedData) {
+    console.log(`🔄 Using cached place details for ${placeId}`);
+    return cachedData;
   }
-
-  // Split into batches - Distance Matrix API has limits on number of destinations per request
-  // The API can handle up to 25 destinations per request, but we'll use 20 to be safe
-  const BATCH_SIZE = 20;
-  const batches = [];
-  
-  for (let i = 0; i < places.length; i += BATCH_SIZE) {
-    batches.push(places.slice(i, i + BATCH_SIZE));
-  }
-
-  console.log(`📏 Calculating distances for ${places.length} places (in ${batches.length} batches)...`);
 
   try {
-    // Process each batch
-    const batchResults = [];
-    
-    for (let i = 0; i < batches.length; i++) {
-      const batch = batches[i];
-      const destinations = batch.map(p => p.location);
-      
-      try {
-        // Use throttling and retry logic
-        const matrixRes = await googleMapsThrottler.throttleDistanceRequest(() => 
-          withRetry(
-            async () => client.distancematrix({
-              params: {
-                origins: [origin],
-                destinations,
-                mode: travelMode,
-                key: config.googleMaps.apiKey,
-              }
-            }),
-            getGoogleMapsRetryConfig()
-          )
-        );
+    // Request throttled to prevent rate limiting
+    const response = await throttle(() => 
+      client.placeDetails({
+        params: {
+          place_id: placeId,
+          key: process.env.GMAPS_API_KEY,
+          fields: ["name", "formatted_address", "geometry", "type"],
+        },
+        timeout: 5000, // 5 seconds timeout
+      })
+    );
 
-        if (!matrixRes.data || !matrixRes.data.rows || matrixRes.data.rows.length === 0) {
-          throw new Error('No valid response from Distance Matrix API');
-        }
-
-        const elements = matrixRes.data.rows[0].elements;
-
-        const batchWithDistances = batch.map((place, j) => {
-          const info = elements[j] || {};
-          return {
-            ...place,
-            distance: info.distance ? info.distance.text : 'N/A',
-            duration: info.duration ? info.duration.text : 'N/A',
-            durationValue: info.duration ? info.duration.value : 999999
-          };
-        });
-
-        batchResults.push(batchWithDistances);
-        console.log(`📏 Batch ${i+1}/${batches.length} processed successfully.`);
-      } catch (err) {
-        // If a batch fails, fall back to Haversine for that batch
-        console.error(`❌ Distance Matrix API batch ${i+1} failed: ${err.message} – falling back to Haversine for this batch.`);
-        
-        const batchWithHaversine = batch.map(place => {
-          if (place.location && place.location.lat && place.location.lng) {
-            const distanceText = distanceUtils.calculateHaversineDistance(
-              origin.lat, origin.lng,
-              place.location.lat, place.location.lng
-            );
-
-            let distanceInKm;
-            if (distanceText.includes('km')) {
-              distanceInKm = parseFloat(distanceText.split(' ')[0]);
-            } else {
-              distanceInKm = parseFloat(distanceText.split(' ')[0]) / 1000;
-            }
-
-            const timeText = distanceUtils.calculateTransitTime(distanceInKm, travelMode);
-
-            return {
-              ...place,
-              distance: `${distanceText} (przybliżone)`,
-              duration: `${timeText} (przybliżone)`,
-              durationValue: distanceInKm * 12
-            };
-          }
-          return { ...place, distance: 'N/A', duration: 'N/A', durationValue: 999999 };
-        });
-
-        batchResults.push(batchWithHaversine);
-      }
+    if (response.data.status === "OK") {
+      const placeData = response.data.result;
+      // Cache the result
+      cache.set(cacheKey, placeData);
+      return placeData;
+    } else {
+      console.error(`❌ Place Details API failed: ${response.data.status} for place ID ${placeId}`);
+      return null;
     }
+  } catch (error) {
+    // If it's a 4xx or 5xx error, log and return null without retrying
+    if (error.response && (error.response.status >= 400)) {
+      console.error(`❌ Place Details API error: ${error.message} for place ID ${placeId}`);
+      return null;
+    }
+    // For network errors or timeouts, log the error
+    console.error(`❌ Place Details API error: ${error.message} for place ID ${placeId}`);
+    return null;
+  }
+};
 
-    // Combine all batch results
-    const result = batchResults.flat();
-
-    // Cache successful result
-    cacheUtils.set(cacheKey, result, DISTANCE_CACHE_TTL);
-    
-    return result;
-
-  } catch (err) {
-    console.error(`❌ Distance Matrix API failed completely: ${err.message} – falling back to Haversine for all places.`);
-
-    // Complete fallback to Haversine
-    const result = places.map(place => {
-      if (place.location && place.location.lat && place.location.lng) {
-        const distanceText = distanceUtils.calculateHaversineDistance(
+/**
+ * Enriches places with distance information using either Distance Matrix API or Haversine
+ * Helper function wrapper for controllers to use
+ * @param {Object} origin - Origin coordinates {lat, lng}
+ * @param {Array} places - Array of places with location property
+ * @param {string} travelMode - Mode of travel (driving, walking, etc)
+ * @returns {Promise<Array>} Places with added distance information
+ */
+const enrichWithDistances = async (origin, places, travelMode) => {
+  if (places.length === 0) return [];
+  
+  // Check if we should even attempt the Distance Matrix API
+  // If too many places (>100), use Haversine for all to save costs and avoid rate limits
+  if (places.length > 100) {
+    console.log(`⚠️ Too many places (${places.length} > 100) - using Haversine for all to avoid rate limits`);
+    return places.map(place => {
+      if (place.location) {
+        const distanceText = require('../utils/distance').calculateHaversineDistance(
           origin.lat, origin.lng,
           place.location.lat, place.location.lng
         );
-
-        let distanceInKm;
-        if (distanceText.includes('km')) {
-          distanceInKm = parseFloat(distanceText.split(' ')[0]);
-        } else {
-          distanceInKm = parseFloat(distanceText.split(' ')[0]) / 1000;
-        }
-
-        const timeText = distanceUtils.calculateTransitTime(distanceInKm, travelMode);
-
+        
+        const distanceInKm = require('../utils/distance').getDistanceInKm(distanceText);
+        const timeText = require('../utils/distance').calculateTransitTime(distanceInKm, travelMode);
+        
         return {
           ...place,
           distance: `${distanceText} (przybliżone)`,
           duration: `${timeText} (przybliżone)`,
-          durationValue: distanceInKm * 12
+          durationValue: distanceInKm * 60 // Very rough estimate: 1 minute per km
         };
       }
       return { ...place, distance: 'N/A', duration: 'N/A', durationValue: 999999 };
     });
-
-    return result;
   }
-}
+  
+  try {
+    // Format data for the distance matrix calculation
+    const origins = [origin];
+    const destinations = places.map(p => p.location);
+    
+    // Get distance matrix data
+    const distanceMatrix = await getDistanceMatrix(origins, destinations);
+    
+    // No need to check if distanceMatrix exists, as getDistanceMatrix always returns a matrix
+    // (using Haversine as fallback)
+    const matrixRow = distanceMatrix[0]; // We only have one origin
+    
+    // Map the matrix results back to places
+    return places.map((place, idx) => {
+      if (matrixRow[idx]) {
+        const { distance, duration } = matrixRow[idx];
+        
+        // Convert meters to km and format for display
+        const distanceInKm = distance / 1000;
+        const distanceText = distanceInKm < 1 
+          ? `${Math.round(distance)} m` 
+          : `${distanceInKm.toFixed(1)} km`;
+        
+        // Convert seconds to minutes/hours for display
+        const durationMins = Math.round(duration / 60);
+        const durationText = durationMins < 60 
+          ? `${durationMins} mins` 
+          : `${Math.floor(durationMins / 60)} hr ${durationMins % 60} mins`;
+        
+        return {
+          ...place,
+          distance: distanceText,
+          duration: durationText,
+          durationValue: duration
+        };
+      }
+      
+      // Fallback to Haversine if missing or null in matrix
+      if (place.location) {
+        const distanceText = require('../utils/distance').calculateHaversineDistance(
+          origin.lat, origin.lng,
+          place.location.lat, place.location.lng
+        );
+        
+        const distanceInKm = require('../utils/distance').getDistanceInKm(distanceText);
+        const timeText = require('../utils/distance').calculateTransitTime(distanceInKm, travelMode);
+        
+        return {
+          ...place,
+          distance: `${distanceText} (przybliżone)`,
+          duration: `${timeText} (przybliżone)`,
+          durationValue: distanceInKm * 60 // Very rough estimate: 1 minute per km
+        };
+      }
+      
+      return { ...place, distance: 'N/A', duration: 'N/A', durationValue: 999999 };
+    });
+  } catch (error) {
+    console.error(`❌ Error in enrichWithDistances: ${error.message}`);
+    
+    // If anything fails, fall back to Haversine for all places
+    return places.map(place => {
+      if (place.location) {
+        const distanceText = require('../utils/distance').calculateHaversineDistance(
+          origin.lat, origin.lng,
+          place.location.lat, place.location.lng
+        );
+        
+        const distanceInKm = require('../utils/distance').getDistanceInKm(distanceText);
+        const timeText = require('../utils/distance').calculateTransitTime(distanceInKm, travelMode);
+        
+        return {
+          ...place,
+          distance: `${distanceText} (przybliżone)`,
+          duration: `${timeText} (przybliżone)`,
+          durationValue: distanceInKm * 60
+        };
+      }
+      return { ...place, distance: 'N/A', duration: 'N/A', durationValue: 999999 };
+    });
+  }
+};
+
+/**
+ * Efficiently calculates distance matrix with optimal batching, caching and fallbacks
+ * Private implementation for enrichWithDistances
+ * @param {Array<{lat: number, lng: number}>} origins - Array of origin coordinates
+ * @param {Array<{lat: number, lng: number}>} destinations - Array of destination coordinates
+ * @returns {Promise<Array<Array<{distance: number, duration: number}>>>} Matrix of distances and durations
+ */
+const getDistanceMatrix = async (origins, destinations) => {
+  if (!origins.length || !destinations.length) {
+    return [];
+  }
+
+  // Initialize result matrix with null values
+  const resultMatrix = Array(origins.length).fill().map(() => Array(destinations.length).fill(null));
+  
+  // Convert coordinates to Google Maps API format
+  const originsFormatted = origins.map(({ lat, lng }) => ({ lat, lng }));
+  const destinationsFormatted = destinations.map(({ lat, lng }) => ({ lat, lng }));
+  
+  // Create optimal batches to maximize efficiency while staying within API limits
+  const batches = createOptimalBatches(originsFormatted, destinationsFormatted);
+  console.log(`📊 Created ${batches.length} optimized batches for distance matrix calculation`);
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const { batchOrigins, batchDestinations, originIndices, destinationIndices } = batch;
+
+    // Generate cache key for this specific combination
+    const cacheKey = generateDistanceMatrixCacheKey(batchOrigins, batchDestinations);
+    const cachedResult = cache.get(cacheKey);
+    
+    if (cachedResult) {
+      console.log(`🔄 Using cached distance matrix for batch ${i+1}/${batches.length}`);
+      // Apply cached results to the result matrix
+      applyBatchResultToMatrix(cachedResult, resultMatrix, originIndices, destinationIndices);
+      continue; // Skip API call for this batch
+    }
+
+    try {
+      console.log(`📡 Requesting Distance Matrix API for batch ${i+1}/${batches.length}`);
+      
+      // Make the API request
+      const response = await client.distancematrix({
+        params: {
+          origins: batchOrigins,
+          destinations: batchDestinations,
+          key: process.env.GMAPS_API_KEY,
+          mode: "driving",
+        },
+        timeout: 10000, // 10 seconds timeout
+      });
+
+      // Process successful response
+      if (response.data.status === "OK") {
+        const batchResult = parseBatchResponse(response.data);
+        cache.set(cacheKey, batchResult);
+        applyBatchResultToMatrix(batchResult, resultMatrix, originIndices, destinationIndices);
+      } else {
+        // If API returns an error status, fallback to Haversine for this batch
+        console.error(`❌ Distance Matrix API batch ${i+1} failed: ${response.data.status} – falling back to Haversine for this batch.`);
+        applyHaversineToMatrix(batchOrigins, batchDestinations, resultMatrix, originIndices, destinationIndices);
+      }
+    } catch (error) {
+      // For 4xx/5xx errors, log error and fallback to Haversine without retries
+      if (error.response && (error.response.status >= 400)) {
+        console.error(`❌ Distance Matrix API batch ${i+1} failed: ${error.message} – falling back to Haversine for this batch.`);
+        applyHaversineToMatrix(batchOrigins, batchDestinations, resultMatrix, originIndices, destinationIndices);
+        continue;
+      }
+      
+      // For network errors, also fallback to Haversine
+      console.error(`❌ Distance Matrix API batch ${i+1} failed: ${error.message || 'Unknown error'} – falling back to Haversine for this batch.`);
+      applyHaversineToMatrix(batchOrigins, batchDestinations, resultMatrix, originIndices, destinationIndices);
+    }
+    
+    // Add a delay between batches to avoid rate limiting
+    if (i < batches.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+
+  return resultMatrix;
+};
+
+/**
+ * Creates optimal batches for distance matrix API to minimize API calls
+ * @param {Array<{lat: number, lng: number}>} origins - Origin coordinates
+ * @param {Array<{lat: number, lng: number}>} destinations - Destination coordinates
+ * @returns {Array<Object>} Array of batch objects
+ */
+const createOptimalBatches = (origins, destinations) => {
+  const batches = [];
+  const totalElements = origins.length * destinations.length;
+  
+  // If total is small enough, we can do it all in one request
+  if (origins.length <= MAX_ORIGINS_PER_REQUEST && 
+      destinations.length <= MAX_DESTINATIONS_PER_REQUEST && 
+      totalElements <= MAX_ELEMENTS_PER_REQUEST) {
+    return [{
+      batchOrigins: origins,
+      batchDestinations: destinations,
+      originIndices: origins.map((_, index) => index),
+      destinationIndices: destinations.map((_, index) => index)
+    }];
+  }
+  
+  // For larger sets, we need to batch optimally
+  // Strategy: Fill each batch with as many elements as possible while respecting all limits
+  let originBatchSize = Math.min(origins.length, MAX_ORIGINS_PER_REQUEST);
+  let destBatchSize = Math.min(
+    destinations.length, 
+    MAX_DESTINATIONS_PER_REQUEST,
+    Math.floor(MAX_ELEMENTS_PER_REQUEST / originBatchSize)
+  );
+  
+  // Adjust batch sizes to get closest to MAX_ELEMENTS_PER_REQUEST without exceeding it
+  while (originBatchSize * destBatchSize > MAX_ELEMENTS_PER_REQUEST) {
+    if (originBatchSize > destBatchSize) {
+      originBatchSize--;
+    } else {
+      destBatchSize--;
+    }
+  }
+  
+  // Create batches using the optimal sizes
+  for (let i = 0; i < origins.length; i += originBatchSize) {
+    const batchOrigins = origins.slice(i, i + originBatchSize);
+    const originIndices = Array.from({length: batchOrigins.length}, (_, idx) => i + idx);
+    
+    for (let j = 0; j < destinations.length; j += destBatchSize) {
+      const batchDestinations = destinations.slice(j, j + destBatchSize);
+      const destinationIndices = Array.from({length: batchDestinations.length}, (_, idx) => j + idx);
+      
+      batches.push({
+        batchOrigins,
+        batchDestinations,
+        originIndices,
+        destinationIndices
+      });
+    }
+  }
+  
+  return batches;
+};
+
+/**
+ * Parses the Google Maps API distance matrix response
+ * @param {Object} data - Response data from Google API
+ * @returns {Array<Array<{distance: number, duration: number}>>} Parsed distance matrix
+ */
+const parseBatchResponse = (data) => {
+  return data.rows.map(row => {
+    return row.elements.map(element => {
+      if (element.status === "OK") {
+        return {
+          distance: element.distance.value,
+          duration: element.duration.value
+        };
+      }
+      return null;
+    });
+  });
+};
+
+/**
+ * Applies batch results to the overall result matrix
+ * @param {Array<Array<{distance: number, duration: number}>>} batchResult - Results from one batch
+ * @param {Array<Array<{distance: number, duration: number}>>} resultMatrix - Overall result matrix
+ * @param {Array<number>} originIndices - Indices mapping batch origins to overall origins
+ * @param {Array<number>} destinationIndices - Indices mapping batch destinations to overall destinations
+ */
+const applyBatchResultToMatrix = (batchResult, resultMatrix, originIndices, destinationIndices) => {
+  for (let i = 0; i < batchResult.length; i++) {
+    const overallOriginIndex = originIndices[i];
+    
+    for (let j = 0; j < batchResult[i].length; j++) {
+      const overallDestIndex = destinationIndices[j];
+      resultMatrix[overallOriginIndex][overallDestIndex] = batchResult[i][j];
+    }
+  }
+};
+
+/**
+ * Applies Haversine distance calculation as fallback
+ * @param {Array<{lat: number, lng: number}>} origins - Batch origin coordinates
+ * @param {Array<{lat: number, lng: number}>} destinations - Batch destination coordinates
+ * @param {Array<Array<{distance: number, duration: number}>>} resultMatrix - Overall result matrix
+ * @param {Array<number>} originIndices - Indices mapping batch origins to overall origins
+ * @param {Array<number>} destinationIndices - Indices mapping batch destinations to overall destinations
+ */
+const applyHaversineToMatrix = (origins, destinations, resultMatrix, originIndices, destinationIndices) => {
+  // Assume average driving speed of 50 km/h for duration estimation (in seconds)
+  const AVG_SPEED_KMH = 50;
+  const METERS_PER_KM = 1000;
+  const SECONDS_PER_HOUR = 3600;
+  
+  for (let i = 0; i < origins.length; i++) {
+    const origin = origins[i];
+    const overallOriginIndex = originIndices[i];
+    
+    for (let j = 0; j < destinations.length; j++) {
+      const destination = destinations[j];
+      const overallDestIndex = destinationIndices[j];
+      
+      const distanceKm = calculateHaversineDistance(
+        origin.lat, origin.lng,
+        destination.lat, destination.lng
+      );
+      
+      // Convert km to meters for consistency with Google API
+      const distanceMeters = distanceKm * METERS_PER_KM;
+      
+      // Estimate duration based on average speed
+      const durationSeconds = (distanceKm / AVG_SPEED_KMH) * SECONDS_PER_HOUR;
+      
+      resultMatrix[overallOriginIndex][overallDestIndex] = {
+        distance: distanceMeters,
+        duration: durationSeconds
+      };
+    }
+  }
+};
+
+/**
+ * Generates a cache key for a specific distance matrix request
+ * @param {Array<{lat: number, lng: number}>} origins - Origin coordinates
+ * @param {Array<{lat: number, lng: number}>} destinations - Destination coordinates
+ * @returns {string} Cache key
+ */
+const generateDistanceMatrixCacheKey = (origins, destinations) => {
+  const originsKey = origins.map(o => `${o.lat.toFixed(6)},${o.lng.toFixed(6)}`).sort().join('|');
+  const destinationsKey = destinations.map(d => `${d.lat.toFixed(6)},${d.lng.toFixed(6)}`).sort().join('|');
+  return `${DISTANCE_MATRIX_CACHE_KEY}-${originsKey}-${destinationsKey}`;
+};
 
 module.exports = {
   getNearbyPlacesGoogle,
