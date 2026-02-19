@@ -27,12 +27,10 @@ const config = {
     'transit_station', // General transit stops (including trams)
     'subway_station',  // Metro stations
     'light_rail_station', // Light rail stations
-    'airport',         // Airports
     'park',            // Parks
     'natural_feature', // Natural features (may include forests, reserves)
     'shopping_mall',   // Shopping malls
     'supermarket',     // Supermarkets
-    'church',          // Churches
     'school',          // Schools (including elementary)
     'hospital',        // Hospitals
     'primary_school',  // Elementary schools
