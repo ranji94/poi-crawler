@@ -37,3 +37,6 @@ temp/
 
 # Docker
 docker-compose.override.yml
+
+# Cached data
+src/services/courtsdata/courts_cache.json
